@@ -1,4 +1,4 @@
-"""Brokers: an in-memory PaperBroker for practice and a thin KiteBroker wrapper."""
+"""A simulated PaperBroker for practice and a read-only gateway to Kite Connect."""
 
 from dataclasses import dataclass, field
 from typing import Literal
@@ -13,7 +13,7 @@ class Order:
     quantity: int
     limit_price: float
     exchange: str = "NSE"
-    product: str = "CNC"  # delivery; avoids intraday auto square-off surprises
+    product: str = "CNC"
 
 
 @dataclass(frozen=True)
@@ -69,53 +69,26 @@ class PaperBroker:
         return self.cash + sum(qty * prices[sym] for sym, qty in self.positions.items())
 
 
-class KiteBroker:
-    """Wraps a logged-in kiteconnect.KiteConnect client."""
+class ReadOnlyKite:
+    """Exposes only the read methods of a kiteconnect.KiteConnect client.
+
+    Order, GTT, mutual fund and SIP methods are deliberately unreachable, so a bug
+    (or a future change) in this project cannot place, modify or cancel anything.
+    """
+
+    ALLOWED = frozenset({
+        "profile", "margins", "holdings", "positions", "orders", "trades",
+        "mf_holdings", "ltp", "ohlc", "quote", "instruments", "historical_data",
+    })
 
     def __init__(self, kite):
-        self.kite = kite
+        self._kite = kite
 
-    def profile(self) -> dict:
-        return self.kite.profile()
+    def __getattr__(self, name):
+        if name not in self.ALLOWED:
+            raise PermissionError(f"'{name}' is blocked: this project is read-only")
+        return getattr(self._kite, name)
 
-    def holdings(self) -> list[dict]:
-        return self.kite.holdings()
-
-    def positions(self) -> dict:
-        return self.kite.positions()
-
-    def margins(self) -> dict:
-        return self.kite.margins()
-
-    def open_quantities(self) -> dict[str, int]:
-        """Delivery shares held: settled + T1 holdings plus today's CNC trades."""
-        qty: dict[str, int] = {}
-        for h in self.kite.holdings():
-            qty[h["tradingsymbol"]] = qty.get(h["tradingsymbol"], 0) + h["quantity"] + h.get("t1_quantity", 0)
-        for p in self.kite.positions()["day"]:
-            if p["product"] == "CNC":
-                qty[p["tradingsymbol"]] = qty.get(p["tradingsymbol"], 0) + p["quantity"]
-        return {sym: q for sym, q in qty.items() if q > 0}
-
-    def day_pnl(self) -> float:
-        return sum(p["pnl"] for p in self.kite.positions()["day"])
-
-    def ltp(self, symbols: list[str], exchange: str = "NSE") -> dict[str, float]:
-        data = self.kite.ltp(*[f"{exchange}:{s}" for s in symbols])
+    def ltp_map(self, symbols: list[str], exchange: str = "NSE") -> dict[str, float]:
+        data = self._kite.ltp(*[f"{exchange}:{s}" for s in symbols])
         return {key.split(":", 1)[1]: v["last_price"] for key, v in data.items()}
-
-    def place_order(self, order: Order) -> str:
-        # LIMIT orders only: SEBI rules restrict plain market orders via API, and
-        # a limit caps how much slippage a bug can cost you.
-        return self.kite.place_order(
-            variety=self.kite.VARIETY_REGULAR,
-            exchange=order.exchange,
-            tradingsymbol=order.symbol,
-            transaction_type=order.side,
-            quantity=order.quantity,
-            product=order.product,
-            order_type=self.kite.ORDER_TYPE_LIMIT,
-            price=order.limit_price,
-            validity=self.kite.VALIDITY_DAY,
-            tag="autotrader",
-        )

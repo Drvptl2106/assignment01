@@ -2,6 +2,7 @@
 .env
 .kite_session.json
 KILL
+exports/
 
 __pycache__/
 *.pyc

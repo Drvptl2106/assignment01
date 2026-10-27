@@ -1,4 +1,7 @@
-"""Command line entry point: python -m autotrader <command>"""
+"""Command line entry point: python -m autotrader <command>
+
+Read-only by design: no command can place, modify or cancel a real order.
+"""
 
 import argparse
 import datetime as dt
@@ -9,9 +12,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from autotrader.backtest import load_prices, run_backtest
-from autotrader.broker import KiteBroker, PaperBroker
-from autotrader.config import LIVE_TRADING_PHRASE, Settings, load_settings
+from autotrader.broker import PaperBroker, ReadOnlyKite
+from autotrader.config import Settings, load_settings
 from autotrader.engine import Trader
+from autotrader.portfolio import Rules, holdings_from_csv, holdings_from_kite, load_sectors, review, snapshot
 from autotrader.risk import RiskManager
 from autotrader.strategy import SmaCrossover
 
@@ -28,28 +32,31 @@ def make_risk(s: Settings) -> RiskManager:
     )
 
 
-def kite_client(s: Settings, need_token: bool = True):
+def kite_client(s: Settings):
     try:
         from kiteconnect import KiteConnect
     except ImportError:
         sys.exit("kiteconnect is not installed: pip install -r requirements.txt")
     if not s.api_key:
         sys.exit("KITE_API_KEY is not set (copy .env.example to .env)")
-    kite = KiteConnect(api_key=s.api_key)
-    if need_token:
-        if not SESSION_FILE.exists():
-            sys.exit("No session. Run: python -m autotrader login")
-        session = json.loads(SESSION_FILE.read_text())
-        if session.get("date") != dt.date.today().isoformat():
-            sys.exit("Session is from a previous day (Kite tokens expire daily). Run login again.")
-        kite.set_access_token(session["access_token"])
-    return kite
+    return KiteConnect(api_key=s.api_key)
+
+
+def read_only_kite(s: Settings) -> ReadOnlyKite:
+    kite = kite_client(s)
+    if not SESSION_FILE.exists():
+        sys.exit("No session. Run: python -m autotrader login")
+    session = json.loads(SESSION_FILE.read_text())
+    if session.get("date") != dt.date.today().isoformat():
+        sys.exit("Session is from a previous day (Kite tokens expire daily). Run login again.")
+    kite.set_access_token(session["access_token"])
+    return ReadOnlyKite(kite)
 
 
 def cmd_login(s: Settings, args) -> None:
     if not s.api_secret:
         sys.exit("KITE_API_SECRET is not set")
-    kite = kite_client(s, need_token=False)
+    kite = kite_client(s)
     print("1. Open this URL and log in with your Zerodha account:\n  ", kite.login_url())
     print("2. You'll be redirected to your redirect URL. Copy the request_token from it.")
     token = input("request_token (or the full redirect URL): ").strip()
@@ -62,17 +69,39 @@ def cmd_login(s: Settings, args) -> None:
 
 
 def cmd_portfolio(s: Settings, args) -> None:
-    broker = KiteBroker(kite_client(s))
-    holdings = broker.holdings()
-    print(f"{'SYMBOL':<14}{'QTY':>6}{'AVG':>12}{'LTP':>12}{'P&L':>12}")
-    total = 0.0
-    for h in holdings:
-        qty = h["quantity"] + h.get("t1_quantity", 0)
-        total += h["pnl"]
-        print(f"{h['tradingsymbol']:<14}{qty:>6}{h['average_price']:>12.2f}{h['last_price']:>12.2f}{h['pnl']:>12.2f}")
-    print(f"{'Total P&L':<44}{total:>12.2f}")
-    equity = broker.margins().get("equity", {})
-    print(f"Available cash: {equity.get('available', {}).get('live_balance', 'n/a')}")
+    sectors = load_sectors(Path(s.sector_file))
+    if args.csv:
+        holdings = holdings_from_csv(Path(args.csv), sectors)
+        cash = args.cash
+    else:
+        kite = read_only_kite(s)
+        holdings = holdings_from_kite(kite.holdings(), sectors)
+        cash = kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0.0)
+
+    rules = Rules(max_holding_pct=s.max_holding_pct, loss_alert_pct=s.loss_alert_pct, gain_alert_pct=s.gain_alert_pct)
+    suggestions = review(holdings, cash, rules)
+
+    total_value = sum(h.value for h in holdings)
+    print(f"{'SYMBOL':<12}{'SECTOR':<14}{'QTY':>6}{'AVG':>10}{'LTP':>10}{'VALUE':>12}{'P&L':>11}{'P&L%':>8}{'WT%':>6}")
+    for h in sorted(holdings, key=lambda h: h.value, reverse=True):
+        weight = h.value / total_value * 100 if total_value else 0
+        print(f"{h.symbol:<12}{h.sector[:13]:<14}{h.quantity:>6}{h.average_price:>10.2f}{h.last_price:>10.2f}"
+              f"{h.value:>12,.0f}{h.pnl:>11,.0f}{h.pnl_pct:>7.1f}%{weight:>5.0f}%")
+    invested = sum(h.invested for h in holdings)
+    pnl_pct = (total_value / invested - 1) * 100 if invested else 0
+    print(f"\nInvested {invested:,.0f} | Value {total_value:,.0f} | P&L {total_value - invested:+,.0f} "
+          f"({pnl_pct:+.1f}%) | Cash {cash:,.0f}")
+
+    print("\nSuggestions (rule-based prompts, not financial advice):")
+    for sug in suggestions:
+        who = f"{sug.symbol}: " if sug.symbol else ""
+        print(f"  [{sug.level}] {who}{sug.message}")
+
+    if args.json:
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(snapshot(holdings, cash, suggestions), indent=2))
+        print(f"\nSaved snapshot to {out}. It contains your holdings: keep it under exports/ (gitignored).")
 
 
 def cmd_backtest(s: Settings, args) -> None:
@@ -89,29 +118,18 @@ def cmd_backtest(s: Settings, args) -> None:
     print(f"Fills:             {result.trades}")
 
 
-def cmd_trade(s: Settings, args) -> None:
-    broker = KiteBroker(kite_client(s))
+def cmd_paper(s: Settings, args) -> None:
+    kite = read_only_kite(s)
     symbols = sorted(s.allowed_symbols)
     risk = make_risk(s)
-    if args.live:
-        if not s.live_trading:
-            sys.exit(f"Refusing live trading: set LIVE_TRADING={LIVE_TRADING_PHRASE} in .env first.")
-        print(f"LIVE MODE. Real orders, real money. Max order {s.max_order_value}, max daily loss {s.max_daily_loss}.")
-        if input("Type LIVE to continue: ").strip() != "LIVE":
-            sys.exit("Aborted.")
-        trader = Trader(SmaCrossover(args.fast, args.slow), risk, live=broker)
-    else:
-        print("PAPER MODE: live prices from Kite, simulated fills. No orders are sent.")
-        trader = Trader(SmaCrossover(args.fast, args.slow), risk, paper=PaperBroker(cash=s.paper_cash))
-
-    print(f"Watching {', '.join(symbols)} every {args.interval}s. Ctrl+C or `touch KILL` to stop.")
+    trader = Trader(SmaCrossover(args.fast, args.slow), risk, paper=PaperBroker(cash=s.paper_cash))
+    print("PAPER MODE: live prices from Kite, simulated fills. No orders are ever sent.")
+    print(f"Watching {', '.join(symbols)} every {args.interval}s. Ctrl+C to stop.")
     seen = 0
     try:
         while not risk.halted_reason:
-            if args.live:
-                risk.set_pnl(broker.day_pnl())
             stamp = dt.datetime.now().strftime("%H:%M:%S")
-            for symbol, price in broker.ltp(symbols).items():
+            for symbol, price in kite.ltp_map(symbols).items():
                 trader.on_price(symbol, price, label=stamp)
             for line in trader.log[seen:]:
                 print(line)
@@ -123,22 +141,24 @@ def cmd_trade(s: Settings, args) -> None:
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(prog="autotrader", description="Zerodha Kite trading sandbox")
+    parser = argparse.ArgumentParser(prog="autotrader", description="Read-only Zerodha portfolio assistant")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("login", help="get today's Kite access token")
-    sub.add_parser("portfolio", help="show holdings (read-only)")
+    pf = sub.add_parser("portfolio", help="show holdings with suggestions (read-only)")
+    pf.add_argument("--csv", help="read holdings from a CSV instead of Kite (no login needed)")
+    pf.add_argument("--cash", type=float, default=0.0, help="cash balance to assume with --csv")
+    pf.add_argument("--json", help="also save a snapshot to this JSON file")
     bt = sub.add_parser("backtest", help="replay a CSV of daily closes")
     bt.add_argument("csv", nargs="?", default="data/sample_synthetic_prices.csv")
     bt.add_argument("-v", "--verbose", action="store_true")
-    tr = sub.add_parser("trade", help="poll live prices and trade (paper unless --live)")
-    tr.add_argument("--live", action="store_true", help="send real orders (needs LIVE_TRADING in .env)")
-    tr.add_argument("--interval", type=int, default=60, help="seconds between price polls")
-    for p in (bt, tr):
+    pp = sub.add_parser("paper", help="paper-trade on live Kite prices (simulated fills only)")
+    pp.add_argument("--interval", type=int, default=60, help="seconds between price polls")
+    for p in (bt, pp):
         p.add_argument("--fast", type=int, default=10)
         p.add_argument("--slow", type=int, default=30)
     args = parser.parse_args(argv)
 
     settings = load_settings()
-    {"login": cmd_login, "portfolio": cmd_portfolio, "backtest": cmd_backtest, "trade": cmd_trade}[args.command](
+    {"login": cmd_login, "portfolio": cmd_portfolio, "backtest": cmd_backtest, "paper": cmd_paper}[args.command](
         settings, args
     )

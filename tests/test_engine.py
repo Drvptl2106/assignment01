@@ -69,11 +69,6 @@ def test_trader_round_trip(tmp_path):
     assert len(trader.paper.fills) == 2
 
 
-def test_trader_requires_exactly_one_broker(tmp_path):
-    with pytest.raises(ValueError):
-        Trader(SmaCrossover(), make_risk(tmp_path))
-
-
 def test_backtest_runs_on_sample_data(tmp_path):
     prices = load_prices(SAMPLE)
     risk = make_risk(tmp_path, allowed_symbols=frozenset(prices), max_orders_per_day=100)
