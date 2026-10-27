@@ -1,0 +1,9 @@
+# Secrets and session tokens: never commit these
+.env
+.kite_session.json
+KILL
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
